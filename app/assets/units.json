@@ -1,0 +1,10 @@
+{
+    "Temperature": "°C",
+    "pH": "pH",
+    "DO": "%",
+    "Agitation Speed": "rpm",
+    "Air Flow Rate": "L/min",
+    "OD600": "",
+    "Glucose Concentration": "g/L",
+    "Lactate Concentration": "g/L"
+}
