@@ -1,0 +1,6 @@
+# Runtime dependencies for the bioreactor monitor web app.
+# Pinned to the versions the project was developed against (Python 3.14).
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+asyncua==2.0.1
+pydantic==2.13.4
