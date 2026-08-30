@@ -102,36 +102,65 @@ def test_inverted_limits_raise():
     with pytest.raises(ValueError):
         range_check(7.5, low=8.0, high=7.0)
 
+
+def test_open_upper_bound_only_flags_high():
+    assert range_check(50.0, low=None, high=90.0) == OK
+    assert range_check(-20.0, low=None, high=90.0) == OK      # no low bound to breach
+    assert range_check(95.0, low=None, high=90.0) == HIGH
+
+
+def test_open_lower_bound_only_flags_low():
+    assert range_check(50.0, low=10.0, high=None) == OK
+    assert range_check(999.0, low=10.0, high=None) == OK
+    assert range_check(5.0, low=10.0, high=None) == LOW
+
+
+def test_open_bound_hysteresis_scales_from_the_bound():
+    # one-sided: margin is 10% of |high| = 9.0, so clearing HIGH needs <= 81.0
+    assert range_check(85.0, low=None, high=90.0, previous=HIGH) == HIGH
+    assert range_check(80.0, low=None, high=90.0, previous=HIGH) == OK
+
 ### Anomaly detection tests
 def test_pure_noise_produces_no_flags():
     rng = random.Random(42)
-    times = list(range(200))
-    values = [36.5 + rng.gauss(0, 0.1) for _ in times]
-    smoothed = ewma_series(times, values, tau=10.0)
-    assert not any(anomaly_flags(values, smoothed))
+    values = [36.5 + rng.gauss(0, 0.1) for _ in range(200)]
+    assert not any(anomaly_flags(values))
 
 
 def test_a_single_spike_is_caught_exactly_once():
     rng = random.Random(42)
-    times = list(range(200))
-    values = [36.5 + rng.gauss(0, 0.1) for _ in times]
+    values = [36.5 + rng.gauss(0, 0.1) for _ in range(200)]
     values[120] += 8 * 0.1              # an eight-sigma excursion
-    smoothed = ewma_series(times, values, tau=10.0)
 
-    flags = anomaly_flags(values, smoothed)
+    flags = anomaly_flags(values)
     assert flags[120] is True
     assert sum(flags) == 1
 
 
 def test_a_slow_drift_is_not_an_anomaly():
-    times = list(range(200))
-    values = [36.5 + 0.01 * t for t in times]   # 0.6 per minute climb
-    smoothed = ewma_series(times, values, tau=10.0)
-    assert not any(anomaly_flags(values, smoothed))
+    rng = random.Random(0)
+    values = [36.5 + 0.02 * t + rng.gauss(0, 0.05) for t in range(300)]  # 2.4/min climb
+    assert not any(anomaly_flags(values))
+
+
+def test_a_steep_drift_is_not_flagged_on_every_point():
+    """The trailing-median baseline used to flag ~every point on a ramp this steep
+    because it lagged the trend; the local linear fit doesn't."""
+    rng = random.Random(1)
+    values = [20.0 + 0.1 * t + rng.gauss(0, 0.05) for t in range(300)]
+    assert sum(anomaly_flags(values)) <= 3         # a couple of noise FPs, not 280
+
+
+def test_a_spike_on_a_ramp_is_still_caught():
+    rng = random.Random(2)
+    values = [20.0 + 0.1 * t + rng.gauss(0, 0.05) for t in range(300)]
+    values[200] += 6.0                              # well clear of the noise
+    flags = anomaly_flags(values)
+    assert flags[200] is True
 
 
 def test_too_little_history_flags_nothing():
-    assert anomaly_flags([1.0, 50.0, 1.0], [1.0, 1.0, 1.0]) == [False] * 3
+    assert anomaly_flags([1.0, 50.0, 1.0]) == [False] * 3
 
 
 def test_robust_sigma_resists_an_outlier_where_stdev_does_not():
@@ -155,7 +184,7 @@ def test_rate_of_change_on_a_linear_ramp_is_the_slope():
 
 
 def test_rate_of_change_is_signed():
-    assert rate_of_change([0, 10], [10.0, 0.0])[1] == pytest.approx(-60.0)
+    assert rate_of_change([0, 10], [10.0, 0.0], 60)[1] == pytest.approx(-60)
 
 
 def test_rate_of_change_survives_a_repeated_timestamp():
