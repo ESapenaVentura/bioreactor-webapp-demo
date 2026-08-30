@@ -1,0 +1,3 @@
+# The OPC-UA bioreactor simulator's dependencies.
+asyncua==2.0.1
+numpy==2.5.2
