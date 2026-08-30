@@ -1,0 +1,31 @@
+# VCS / tooling
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+.github
+
+# Python caches / local venvs
+__pycache__/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node / vendored-lib build leftovers (the served uPlot files live in app/static/)
+package/
+dist/
+node_modules/
+*.tgz
+
+# Scratch, sample data, docs, runtime state
+scratch/
+90_secs_data.json
+*.md
+LICENSE
+app/data/
+
+# The simulator has its own build context (./bioreactor-server)
+bioreactor-server/
