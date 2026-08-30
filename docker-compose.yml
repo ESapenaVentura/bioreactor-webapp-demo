@@ -1,0 +1,39 @@
+# Full stack: the OPC-UA bioreactor simulator + the web app that reads it.
+#
+#   docker compose up --build
+#
+# then open http://localhost:8000
+
+services:
+  bioreactor-server:
+    build: ./bioreactor-server
+    environment:
+      LOG_LEVEL: WARNING          # DEBUG for the full per-reading firehose
+    # Uncomment to also reach the simulator from the host (e.g. a local dev app):
+    # ports:
+    #   - "4840:4840"
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "8000:8000"
+    environment:
+      SERVER_URL: opc.tcp://bioreactor-server:4840/ganymede/server/
+      NAMESPACE_URI: http://examples.ganymede.github.io
+      # REACTOR: Cytiva Wave
+      # BROADCAST_HZ: "4"
+    depends_on:
+      bioreactor-server:
+        condition: service_healthy      # wait until :4840 accepts connections
+    volumes:
+      # Named volume: Docker owns it and seeds it from the image, so the non-root
+      # `app` user can write saved watchlists to it. Survives up/down.
+      #   inspect:  docker compose exec app cat app/data/watchlists.json
+      - watchlist-data:/app/app/data
+    restart: unless-stopped
+
+volumes:
+  watchlist-data:
