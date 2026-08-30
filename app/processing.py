@@ -36,22 +36,32 @@ OK, LOW, HIGH = "ok", "low", "high"
 
 
 def range_check(value, low, high, previous=OK, hysteresis_frac=0.1) -> str:
-    if high <= low:
+    """Classify ``value`` against a band. Either bound may be ``None`` (open).
+
+    With both bounds set, the hysteresis margin is a fraction of the band width.
+    With only one bound, there is no width to scale from, so the margin is a
+    fraction of that bound's magnitude instead.
+    """
+    if low is not None and high is not None and high <= low:
         raise ValueError("high must be greater than low")
 
-    margin = hysteresis_frac * (high - low)
+    if low is not None and high is not None:
+        margin_low = margin_high = hysteresis_frac * (high - low)
+    else:
+        margin_low = hysteresis_frac * abs(low) if low is not None else 0.0
+        margin_high = hysteresis_frac * abs(high) if high is not None else 0.0
 
     # Hysteresis only makes CLEARING harder. It must never suppress a fresh
     # alarm: a value that crosses from below-low straight to above-high has not
     # "recovered", and an early return of OK here would report it in spec.
-    if previous == LOW and value < low + margin:
+    if previous == LOW and low is not None and value < low + margin_low:
         return LOW
-    if previous == HIGH and value > high - margin:
+    if previous == HIGH and high is not None and value > high - margin_high:
         return HIGH
 
-    if value < low:
+    if low is not None and value < low:
         return LOW
-    if value > high:
+    if high is not None and value > high:
         return HIGH
     return OK
 
@@ -62,38 +72,86 @@ def robust_sigma(values) -> float:
     return 1.4826 * median([abs(v - centre) for v in values])
 
 
-def rolling_median(values, window: int) -> list[float]:
-    """Median of each trailing window.
+def _robust_line(pts):
+    """OLS line through (x, y) points, refined by a few rounds of MAD-based
+    outlier trimming so a spike inside the window can't tilt it."""
+    xs = [x for x, _ in pts]
+    ys = [y for _, y in pts]
+    slope = 0.0
+    for _ in range(3):
+        n = len(xs)
+        if n < 3:
+            break
+        xb = sum(xs) / n
+        yb = sum(ys) / n
+        sxx = sum((x - xb) ** 2 for x in xs)
+        sxy = sum((x - xb) * (y - yb) for x, y in zip(xs, ys))
+        slope = sxy / sxx if sxx else 0.0
+        intercept = yb - slope * xb
+        res = [y - (slope * x + intercept) for x, y in zip(xs, ys)]
+        mad = median(abs(r) for r in res)
+        if mad == 0:
+            break
+        keep = [i for i, r in enumerate(res) if abs(r) <= 3.5 * mad]
+        if len(keep) == n or len(keep) < max(3, n // 2):
+            break
+        xs = [xs[i] for i in keep]
+        ys = [ys[i] for i in keep]
+    intercept = median(y - slope * x for x, y in zip(xs, ys))
+    return slope, intercept
 
-    Used as the anomaly baseline instead of the EWMA. An EWMA chases the very
-    spike it is meant to expose, which makes the residual small at the spike and
-    large for the next twenty samples as it recovers.
+
+def local_trend(values, window: int, gap: int = 3) -> list[float]:
+    """Baseline for anomaly detection: a robust straight line fitted to the
+    window *ending ``gap`` samples before* each point, then extrapolated to it.
+
+    Two design choices matter:
+
+    * A line, not a trailing median. A steady drift then leaves a flat residual
+      instead of one that creeps toward the threshold and trips on every sample
+      (the trailing median lagged the trend by half a window).
+    * The ``gap`` keeps the point under test — and the couple before it — out of
+      its own baseline, so a real excursion can't fit itself and disappear, and
+      the excursion's echo does not linger in the fit for long afterwards.
     """
     out = []
-    for i in range(len(values)):
-        start = max(0, i - window + 1)
-        out.append(median(values[start : i + 1]))
+    n = len(values)
+    for i in range(n):
+        hi = i - gap
+        lo = hi - window + 1
+        if lo < 0:                              # not enough clean history yet
+            out.append(median(values[max(0, i - window + 1) : i + 1]))
+            continue
+        pts = list(enumerate(values[lo : hi + 1]))     # local x = 0 .. window-1
+        slope, intercept = _robust_line(pts)
+        out.append(intercept + slope * (i - lo))       # extrapolate to i
     return out
 
 
-def anomaly_flags(values, k=4.0, window=21) -> list[bool]:
-    """Flag points that sit implausibly far from their local median.
+def anomaly_flags(values, k=4.0, window=21, gap=3) -> list[bool]:
+    """Flag points that sit implausibly far from their local trend.
 
-    Median baseline plus MAD scatter: both halves are robust, so one bad point
-    can neither move the baseline nor inflate the threshold that judges it.
+    Robust local linear detrend, then MAD scatter on the residuals: a drift no
+    longer biases the residual, and one bad point can neither tilt the line nor
+    inflate the threshold that judges it.
     """
     flags = [False] * len(values)
     if len(values) < window:
         return flags                  # not enough history to judge
 
-    baseline = rolling_median(values, window)
+    baseline = local_trend(values, window, gap)
     residuals = [v - b for v, b in zip(values, baseline)]
 
-    sigma = robust_sigma(residuals)
+    # Scatter from the full-window fits only — the warm-up region falls back to a
+    # plain median and would distort the estimate.
+    settled = window + gap - 1
+    if len(residuals) <= settled:
+        return flags
+    sigma = robust_sigma(residuals[settled:])
     if sigma <= 0:
         return flags                  # constant or perfectly linear: no scatter
 
-    for i in range(window - 1, len(values)):   # skip the warm-up
+    for i in range(settled, len(values)):
         flags[i] = abs(residuals[i]) > k * sigma
     return flags
 

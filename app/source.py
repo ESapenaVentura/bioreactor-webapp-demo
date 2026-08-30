@@ -21,15 +21,15 @@ class _SubHandler:
     """Runs inline with subscription dispatch — must not block."""
 
     def __init__(self, names, queue):
-        self._names = names
+        self._names = names          # node -> (reactor, category, sensor)
         self._queue = queue
         self.dropped = 0
 
     async def datachange_notification(self, node, value, data):
-        category, sensor = self._names[node]
+        reactor, category, sensor = self._names[node]
         dv = data.monitored_item.Value
         reading = Reading(
-            reactor=config.REACTOR,
+            reactor=reactor,
             category=category,
             sensor=sensor,
             value=float(value),
@@ -42,29 +42,60 @@ class _SubHandler:
             self.dropped += 1
 
 
-async def run_source(queue) -> None:
-    """Subscribe to every sensor on the configured reactor. Runs until cancelled."""
+async def _discover(client):
+    """Every reactor on the server -> {sensor_node: (reactor, category, sensor)}.
+
+    A "reactor" is any Objects child that owns sensor nodes, i.e. children whose
+    display name matches the "Category - Sensor" pattern. That filter skips the
+    server's own housekeeping objects (Server, Aliases, Locations).
+    """
+    names = {}
+    reactors = set()
+    for obj in await client.nodes.objects.get_children():
+        reactor = (await obj.read_display_name()).Text
+        for child in await obj.get_children():
+            display = (await child.read_display_name()).Text
+            if " - " not in display:
+                continue
+            category, sensor = split_display_name(display)
+            names[child] = (reactor, category, sensor)
+            reactors.add(reactor)
+    return names, sorted(reactors)
+
+
+async def run_source(queue, status=None) -> None:
+    """Subscribe to every sensor on every reactor. Runs until cancelled.
+
+    If ``status`` is given it is a shared dict the web layer reads: ``connected``
+    flips True once the subscription is live and False again on the way out, and
+    ``reactors`` lists what was discovered.
+    """
     client = Client(
         url=config.SERVER_URL,
         auto_reconnect=True,
         reconnect_max_delay=config.RECONNECT_MAX_SECONDS,
     )
     async with client:
-        idx = await client.get_namespace_index(uri=config.NAMESPACE_URI)
-        reactor = await client.nodes.objects.get_child(f"{idx}:{config.REACTOR}")
-        sensors = await reactor.get_children()
+        await client.get_namespace_index(uri=config.NAMESPACE_URI)
+        names, reactors = await _discover(client)
+        if not names:
+            raise RuntimeError("no reactor sensors found on the server")
 
-        names = {}
-        for sensor in sensors:
-            display = await sensor.read_display_name()
-            names[sensor] = split_display_name(display.Text)
-
+        sensors = list(names)
         handler = _SubHandler(names, queue)
         subscription = await client.create_subscription(
             config.PUBLISHING_INTERVAL_MS, handler
         )
         await subscription.subscribe_data_change(sensors)
-        log.info("subscribed to %d sensors on %s", len(sensors), config.REACTOR)
+        log.info(
+            "subscribed to %d sensors across %d reactors: %s",
+            len(sensors), len(reactors), ", ".join(reactors),
+        )
+
+        if status is not None:
+            status["connected"] = True
+            status["last_error"] = None           # a live link is not "broken"
+            status["reactors"] = reactors
 
         try:
             await asyncio.Event().wait()          # park until cancelled
@@ -74,6 +105,36 @@ async def run_source(queue) -> None:
             except Exception:
                 pass                              # server already gone
             raise
+        finally:
+            if status is not None:
+                status["connected"] = False
+
+
+async def run_source_forever(queue, status) -> None:
+    """Keep a source subscription alive across outages.
+
+    asyncua's auto_reconnect only supervises a link that was already up; it does
+    not retry the *initial* connect. So we do, with exponential backoff, and we
+    report what happened through the shared ``status`` dict rather than crashing
+    the app — a monitor should start whether or not the instrument is up.
+    """
+    delay = 1.0
+    while True:
+        try:
+            await run_source(queue, status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                  # noqa: BLE001 — report anything
+            status["connected"] = False
+            status["last_error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("source failed (%s) — retrying in %.0fs", exc, delay)
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            delay = min(delay * 2, float(config.RECONNECT_MAX_SECONDS))
+        else:
+            delay = 1.0                           # clean exit: reset the backoff
 
 
 # --------------------------------------------------------------- smoke test
