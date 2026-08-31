@@ -70,13 +70,23 @@ function hiddenSet() {
     (chartHiddenByReactor[currentReactor] = new Set());
 }
 
-// The tile follows a sensor's most recent anomaly (by full key).
-function latestAnomalyKey(key) {
+// What a tile latches onto for its sensor (by full "Reactor|Sensor" key).
+// An unacknowledged watchlist breach (high/low) outranks a statistical anomaly —
+// a hard limit crossing matters more than "unusual", so a later anomaly must not
+// bury a still-open breach. Within a kind the most recent wins. With nothing
+// open, fall back to the most recent row so the tile can render its cleared
+// state.
+function latchedIssue(key) {
+  let breach, anomaly, newest;
   for (let i = anomalyLog.length - 1; i >= 0; i--) {
     const e = anomalyLog[i];
-    if (e.reactor + "|" + e.sensor === key) return e;
+    if (e.reactor + "|" + e.sensor !== key) continue;
+    if (!newest) newest = e;
+    if (e.acked) continue;
+    if (e.kind === "high" || e.kind === "low") { if (!breach) breach = e; }
+    else if (!anomaly) anomaly = e;
   }
-  return undefined;
+  return breach || anomaly || newest;
 }
 
 // ---------------------------------------------------------- anomaly log (server)
@@ -93,6 +103,7 @@ function applyAnomalies(list) {
   }
   renderAnomalyTable();
   renderStatusBand();
+  renderBreachIndicators();   // a latched breach clears from the strip on ack
   // Tiles latch onto their sensor's most recent open anomaly.
   for (const name of Object.keys(tiles)) {
     const d = lastData[keyFor(name)];
@@ -210,7 +221,7 @@ function renderTile(name, d) {
   const el = tiles[name];
   if (!el) return;
 
-  const open = latestAnomalyKey(keyFor(name));
+  const open = latchedIssue(keyFor(name));
   const latched = !!(open && !open.acked);
   const targetId = latched ? open.id : "";
   if (el.dataset.ackId !== targetId) {
@@ -240,7 +251,7 @@ function renderAck(name) {
   const box = el.querySelector(".ack");
   if (!box) return;
 
-  const open = latestAnomalyKey(keyFor(name));
+  const open = latchedIssue(keyFor(name));
   if (!open || open.acked) {
     box.hidden = true;
     box.innerHTML = "";
@@ -248,9 +259,14 @@ function renderAck(name) {
   }
 
   const when = new Date(open.at * 1000).toLocaleTimeString();
+  const what = open.kind === "high"
+    ? `above limit${open.threshold != null ? ` (> ${open.threshold})` : ""}`
+    : open.kind === "low"
+      ? `below limit${open.threshold != null ? ` (< ${open.threshold})` : ""}`
+      : "anomaly";
   box.hidden = false;
   box.innerHTML =
-    `<span class="ack-when">⚠ anomaly at ${when}</span>` +
+    `<span class="ack-when">⚠ ${what} at ${when}</span>` +
     `<button type="button" class="ack-btn" data-id="${open.id}">I acknowledge the anomaly</button>`;
 }
 
@@ -293,7 +309,7 @@ function exportCsv(entries) {
     e.acked ? "yes" : "no",
     e.ackedAt ? new Date(e.ackedAt * 1000).toISOString() : "",
   ]));
-  downloadCsv(`${safe(currentReactor)}-anomalies-${stamp()}.csv`, rows);
+  downloadCsv(`${safe(currentReactor)}-anomalies-$stamp()}.csv`, rows);
 }
 
 // Full trend history for one sensor of the currently-shown reactor.
@@ -638,21 +654,39 @@ async function initReactors() {
 
 // ---------------------------------------------------------------- watchlist
 
-// Sensors that are currently outside their watchlist band on `reactor`.
+// Watchlist alarms on `reactor` that still need attention: either the value is
+// currently outside its band (`live`), or it has recovered but the crossing is
+// still unacknowledged in the log (latched). The top-of-page indicators — alarm
+// strip, status-band chip, reactor-dropdown ⚠ — stay up until an operator
+// acknowledges, the same way the tiles latch.
 function reactorBreaches(reactor) {
   const prefix = reactor + "|";
-  const out = [];
+  const byName = new Map();
+
   for (const [key, d] of Object.entries(lastData)) {
     if (!key.startsWith(prefix)) continue;
     if (d.status !== "low" && d.status !== "high") continue;
     const name = key.slice(prefix.length);
     const band = (watchlistActive[reactor] || {})[name] || {};
-    out.push({
+    byName.set(name, {
       sensor: name, status: d.status, value: d.value,
       threshold: d.status === "high" ? band.max : band.min,
+      live: true,
     });
   }
-  return out;
+
+  for (let i = anomalyLog.length - 1; i >= 0; i--) {
+    const e = anomalyLog[i];
+    if (e.reactor !== reactor || e.acked) continue;
+    if (e.kind !== "high" && e.kind !== "low") continue;
+    if (byName.has(e.sensor)) continue;          // a live entry already covers it
+    byName.set(e.sensor, {
+      sensor: e.sensor, status: e.kind, value: e.value,
+      threshold: e.threshold, live: false,
+    });
+  }
+
+  return [...byName.values()];
 }
 
 function fmtVal(name, v) {
@@ -666,15 +700,19 @@ function renderBreachIndicators() {
   const here = currentReactor ? reactorBreaches(currentReactor) : [];
   if (here.length) {
     strip.hidden = false;
+    // amber, not red, once every alarm has recovered and only the ack is pending
+    strip.classList.toggle("pending", here.every((b) => !b.live));
     strip.innerHTML =
       `<span>⚠ ${here.length} watchlist alarm${here.length > 1 ? "s" : ""}</span>` +
       `<span class="items">` + here.map((b) => {
+        if (!b.live) return `${b.sensor} ${b.status.toUpperCase()} · awaiting acknowledgement`;
         const op = b.status === "high" ? ">" : "<";
         const t = b.threshold != null ? ` ${op} ${b.threshold}` : "";
         return `${b.sensor} ${b.status.toUpperCase()} ${fmtVal(b.sensor, b.value)}${t}`;
       }).join(" · ") + `</span>`;
   } else {
     strip.hidden = true;
+    strip.classList.remove("pending");
     strip.innerHTML = "";
   }
 
