@@ -31,9 +31,11 @@ Each sensor's stream is watched for points that sit implausibly far from its
 recent trend. The detector fits a robust local line to a trailing window and
 flags residuals past a MAD-scaled threshold, and it only reports an anomaly once
 it has held for a few consecutive readings — so ordinary noise and drift don't
-trip it. Detected anomalies land in a paginated, acknowledgeable table (with CSV
-export) that persists across reloads. Detection runs for **all** reactors, so an
-anomaly on one you aren't currently viewing still shows up.
+trip it. Detection runs on the server for **all** reactors, so an anomaly on one
+you aren't currently viewing still shows up. Detected anomalies land in a
+paginated, acknowledgeable table — stored server-side in `app/data/`, capped at
+100 rows per reactor, and the same for every browser — with CSV export of the
+selected rows. Each sensor tile also exports its full trend history to CSV.
 
 ### Watchlist
 
@@ -89,8 +91,8 @@ and it survives a restart.
 5. **Stop it**
 
    ```bash
-   docker compose down          # keep saved watchlists
-   docker compose down -v       # also delete the watchlist volume
+   docker compose down          # keep saved watchlists + anomaly log
+   docker compose down -v       # also delete the app/data volume
    ```
 
 ### Trying the features
@@ -139,6 +141,7 @@ All settings are environment variables (see `app/config.py`):
 | `REACTOR` | `Cytiva Wave` | reactor selected by default |
 | `BROADCAST_HZ` | `4.0` | WebSocket frame rate |
 | `ANOMALY_CONFIRM` | `3` | consecutive flagged readings before an anomaly is reported |
+| `MAX_ANOMALIES` | `100` | anomaly-log rows kept **per reactor** before the oldest is dropped |
 
 ## Tests
 
