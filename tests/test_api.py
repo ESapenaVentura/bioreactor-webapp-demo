@@ -66,8 +66,9 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "run_source_forever", _no_source)
     # Faster than the 4 Hz default so websocket tests don't dawdle.
     monkeypatch.setattr(main.config, "BROADCAST_HZ", 50.0)
-    # Never touch the real watchlist file.
+    # Never touch the real watchlist / anomaly-log files.
     monkeypatch.setattr("app.watchlist.FILE", tmp_path / "watchlists.json")
+    monkeypatch.setattr("app.anomalies.FILE", tmp_path / "anomalies.json")
 
     with TestClient(main.app) as c:
         yield c
@@ -248,6 +249,61 @@ def test_watchlist_save_load_delete(client):
     assert d.status_code == 200 and d.json()["names"] == []
     assert client.get("/api/watchlist/saved/SOP limits",
                       params={"reactor": "Cytiva Wave"}).status_code == 404
+
+
+# --- anomaly log -----------------------------------------------------
+
+def _noisy(n, level=36.5, noise=0.02, seed=0):
+    import random
+    rng = random.Random(seed)
+    return [level + rng.gauss(0, noise) for _ in range(n)]
+
+
+def test_anomalies_start_empty(client):
+    assert client.get("/api/anomalies").json() == {"anomalies": []}
+
+
+def test_inject_writes_one_anomaly_row_through_drain(client):
+    store = client.app.state.store
+    _seed(store, "Temperature", values=_noisy(90))
+
+    r = client.post("/api/debug/inject", json={"sensor": "Temperature", "sigmas": 15})
+    assert r.status_code == 200
+
+    assert _wait_until(
+        lambda: len(client.get("/api/anomalies").json()["anomalies"]) == 1
+    ), "the injected excursion never reached the anomaly log"
+
+    row = client.get("/api/anomalies").json()["anomalies"][0]
+    assert row["reactor"] == REACTOR and row["sensor"] == "Temperature"
+    assert row["kind"] == "anomaly" and row["acked"] is False and row["ackedAt"] is None
+
+
+def test_ack_and_ack_all_endpoints(client):
+    anomalies = client.app.state.anomalies
+    a = anomalies.record("Cytiva Wave", "pH", 7.9, 1.0, "high", 7.5)
+    b = anomalies.record("Cytiva Wave", "DO", 12.0, 2.0, "low", 20.0)
+    c = anomalies.record("Cytiva XDR", "pH", 8.1, 3.0, "high", 7.5)
+
+    got = client.post("/api/anomalies/ack", json={"ids": [a["id"]]}).json()["anomalies"]
+    by_id = {e["id"]: e for e in got}
+    assert by_id[a["id"]]["acked"] is True and by_id[a["id"]]["ackedAt"] is not None
+    assert by_id[b["id"]]["acked"] is False
+
+    # ack-all scoped to one reactor leaves the other reactor's row open
+    client.post("/api/anomalies/ack-all", json={"reactor": "Cytiva Wave"})
+    rows = {e["id"]: e for e in client.get("/api/anomalies").json()["anomalies"]}
+    assert rows[b["id"]]["acked"] is True
+    assert rows[c["id"]]["acked"] is False
+
+
+def test_anomalies_can_be_scoped_to_a_reactor(client):
+    anomalies = client.app.state.anomalies
+    anomalies.record("Cytiva Wave", "pH", 7.9, 1.0, "high", 7.5)
+    anomalies.record("Cytiva XDR", "pH", 8.1, 2.0, "high", 7.5)
+
+    scoped = client.get("/api/anomalies", params={"reactor": "Cytiva XDR"}).json()
+    assert [e["reactor"] for e in scoped["anomalies"]] == ["Cytiva XDR"]
 
 
 def test_watchlist_unload_clears_limits(client):
