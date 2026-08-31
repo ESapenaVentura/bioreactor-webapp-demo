@@ -207,7 +207,7 @@ function makeTile(name) {
     <div class="val">—</div>
     <div class="sub"><span class="roc"></span><span class="flags"></span></div>
     <div class="tile-tools">
-      <label><input type="checkbox" class="chart-vis"${showGraph ? " checked" : ""}> graph</label>
+      <label><input type="checkbox" class="chart-vis"${showGraph ? " checked" : ""}>Dashboard</label>
       <button type="button" class="show-graph">Show graph</button>
       <button type="button" class="tile-csv">Export CSV</button>
     </div>
