@@ -14,6 +14,8 @@ database: the working set lives in memory, alarm limits persist to a small JSON
 file, and the whole thing ships as two containers you bring up with a single
 command.
 
+![](readme_assets/architecture.png)
+
 ## Features
 
 ### Live sensor feed
