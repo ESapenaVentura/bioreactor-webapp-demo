@@ -25,8 +25,6 @@ let currentReactor = null;
 
 const history = {};      // "Reactor|Sensor" -> {t:[], v:[], s:[]}   (all reactors)
 const lastData = {};     // "Reactor|Sensor" -> last payload seen      (all reactors)
-const wasAnomalous = {}; // "Reactor|Sensor" -> previous d.anomaly     (all reactors)
-const wasStatus = {};    // "Reactor|Sensor" -> previous d.status      (all reactors)
 
 // Watchlists (server-authoritative). Kept per reactor so an off-screen reactor's
 // breach can still show a warning by the dropdown.
@@ -48,15 +46,16 @@ function splitKey(key) {
 }
 const keyFor = (name) => currentReactor + "|" + name;
 
-// Permanent log of detected anomalies, oldest-first, capped at MAX_ANOMALIES.
-// Past the cap it's a ring buffer: each new entry drops the oldest.
-const anomalyLog = [];   // [{ id, reactor, sensor, value, at, acked, ackedAt }]
+// Local mirror of the server-side anomaly log (app/data/anomalies.json), oldest
+// first. The server detects anomalies and ring-buffers the file at
+// config.MAX_ANOMALIES *per reactor*; this array is just what the last fetch
+// returned. Refreshed on a timer and after every acknowledge.
+const anomalyLog = [];   // [{ id, reactor, sensor, value, at, kind, threshold, acked, ackedAt }]
 let anomalyPage = 0;
 const selected = new Set();
 
-const MAX_ANOMALIES = 100;
 const PAGE_SIZE = 20;
-const LOG_KEY = "bioreactor.anomalyLog.v3";   // v3 adds `kind` + `threshold`
+const ANOMALY_POLL_MS = 3000;
 const UI_KEY = "bioreactor.ui.v1";
 const REACTOR_KEY = "bioreactor.reactor.v1";  // last selected reactor (global)
 
@@ -71,9 +70,6 @@ function hiddenSet() {
     (chartHiddenByReactor[currentReactor] = new Set());
 }
 
-const newId = () =>
-  window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
 // The tile follows a sensor's most recent anomaly (by full key).
 function latestAnomalyKey(key) {
   for (let i = anomalyLog.length - 1; i >= 0; i--) {
@@ -83,59 +79,53 @@ function latestAnomalyKey(key) {
   return undefined;
 }
 
-// ---------------------------------------------------------------- localStorage
+// ---------------------------------------------------------- anomaly log (server)
 
-function commitAnomalies() {
-  saveAnomalies();
+// Replace the local mirror with a fresh copy from the server and re-render
+// everything that reads it. The server is the single source of truth.
+function applyAnomalies(list) {
+  anomalyLog.length = 0;
+  if (Array.isArray(list)) {
+    for (const e of list) anomalyLog.push(e);
+  }
+  for (const id of [...selected]) {
+    if (!anomalyLog.some((e) => e.id === id)) selected.delete(id);
+  }
   renderAnomalyTable();
-}
-
-function saveAnomalies() {
-  try {
-    localStorage.setItem(LOG_KEY, JSON.stringify(anomalyLog));
-  } catch (_) {
-    /* private mode / quota / disabled — degrade to in-memory only */
+  renderStatusBand();
+  // Tiles latch onto their sensor's most recent open anomaly.
+  for (const name of Object.keys(tiles)) {
+    const d = lastData[keyFor(name)];
+    if (d) renderTile(name, d);
+    else renderAck(name);
   }
 }
 
-function loadAnomalies() {
+async function fetchAnomalies() {
   try {
-    let raw = localStorage.getItem(LOG_KEY);
-    let legacyKey = null;
-    if (!raw) {
-      legacyKey = ["bioreactor.anomalyLog.v2", "bioreactor.anomalyLog.v1"]
-        .find((k) => localStorage.getItem(k));
-      raw = legacyKey && localStorage.getItem(legacyKey);
-    }
-    if (!raw) return;
-    const saved = JSON.parse(raw);
-    if (!Array.isArray(saved)) return;
-    anomalyLog.length = 0;
-    for (const e of saved.slice(-MAX_ANOMALIES)) {
-      if (e && typeof e.at === "number" && typeof e.sensor === "string") {
-        anomalyLog.push({
-          id: e.id || newId(),
-          // pre-v2 entries predate multi-reactor — they were all Cytiva Wave.
-          reactor: e.reactor || "Cytiva Wave",
-          sensor: e.sensor,
-          value: Number(e.value),
-          at: e.at,
-          // pre-v3 entries were all statistical anomalies.
-          kind: e.kind || "anomaly",
-          threshold: typeof e.threshold === "number" ? e.threshold : null,
-          acked: !!e.acked,
-          ackedAt: typeof e.ackedAt === "number" ? e.ackedAt : null,
-        });
-      }
-    }
-    if (legacyKey) {
-      saveAnomalies();
-      localStorage.removeItem(legacyKey);
-    }
+    const d = await (await fetch("/api/anomalies")).json();
+    applyAnomalies(d.anomalies);
   } catch (_) {
-    localStorage.removeItem(LOG_KEY);
+    /* transient — keep the last copy, the poll will retry */
   }
 }
+
+async function ackAnomalies(url, body) {
+  try {
+    const d = await (await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).json();
+    applyAnomalies(d.anomalies);
+  } catch (_) {
+    fetchAnomalies();   // fall back to a plain refresh
+  }
+}
+
+const acknowledge = (id) => ackAnomalies("/api/anomalies/ack", { ids: [id] });
+
+// ---------------------------------------------------------------- localStorage
 
 function saveUiPrefs() {
   try {
@@ -168,57 +158,23 @@ function loadUiPrefs() {
   }
 }
 
-// ---------------------------------------------------------------- acknowledge
-
-function markAcked(id) {
-  const entry = anomalyLog.find((e) => e.id === id);
-  if (!entry || entry.acked) return null;
-  entry.acked = true;
-  entry.ackedAt = Date.now() / 1000;
-  return entry;
-}
-
-function reflectAck(entry) {
-  if (!entry || entry.reactor !== currentReactor) return;
-  const d = lastData[entry.reactor + "|" + entry.sensor];
-  if (d && tiles[entry.sensor]) renderTile(entry.sensor, d);
-  renderAck(entry.sensor);
-}
-
-function acknowledge(id) {
-  const entry = markAcked(id);
-  if (!entry) return;
-  commitAnomalies();
-  reflectAck(entry);
-}
-
 // ---------------------------------------------------------------- ingest
 
-function logEntry(reactor, name, d, kind, threshold) {
-  anomalyLog.push({
-    id: newId(), reactor, sensor: name, value: d.value, at: d.time,
-    kind, threshold: threshold ?? null, acked: false, ackedAt: null,
-  });
-  if (anomalyLog.length > MAX_ANOMALIES) anomalyLog.shift();
-  commitAnomalies();
-}
+// Set when a tick shows a sensor entering an alarm state, so handleTick can pull
+// the freshly-written server row now instead of waiting for the 3 s poll.
+let anomalyLogStale = false;
 
 // Runs for every sensor in every frame, regardless of which reactor is shown.
+// Detection + logging now live on the server (see app/anomalies.py); the browser
+// only keeps the per-sensor history for the charts and CSV export.
 function ingest(key, reactor, name, d) {
   if (!history[key]) history[key] = { t: [], v: [], s: [] };
-  lastData[key] = d;
-
-  // Statistical anomaly — one row per false->true edge.
-  if (d.anomaly && !wasAnomalous[key]) logEntry(reactor, name, d, "anomaly", null);
-  wasAnomalous[key] = d.anomaly;
-
-  // Watchlist crossing — one row on any change into (or between) alarm states.
-  if (d.status !== "ok" && d.status !== wasStatus[key]) {
-    const band = (watchlistActive[reactor] || {})[name] || {};
-    logEntry(reactor, name, d, d.status, d.status === "high" ? band.max : band.min);
+  const prev = lastData[key];
+  if ((d.anomaly && !prev?.anomaly) ||
+      (d.status !== "ok" && d.status !== (prev?.status ?? "ok"))) {
+    anomalyLogStale = true;
   }
-  wasStatus[key] = d.status;
-
+  lastData[key] = d;
   pushPoint(key, d.time, d.value, d.smoothed);
 }
 
@@ -242,6 +198,7 @@ function makeTile(name) {
     <div class="tile-tools">
       <label><input type="checkbox" class="chart-vis"${showGraph ? " checked" : ""}> graph</label>
       <button type="button" class="show-graph">Show graph</button>
+      <button type="button" class="tile-csv">Export CSV</button>
     </div>
     <div class="ack" hidden></div>`;
   document.getElementById("tiles").appendChild(el);
@@ -304,10 +261,28 @@ const csvCell = (v) => {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+// Full ISO 8601 timestamp, made filename-safe: 2026-08-31T14-07-22.481Z
+const stamp = () => new Date().toISOString().replace(/:/g, "-");
+// Strip anything a filesystem might choke on out of a reactor / sensor name.
+const safe = (s) => String(s).replace(/[^A-Za-z0-9_-]+/g, "_");
+
+// rows = array of arrays; first row is the header. Triggers a file download.
+function downloadCsv(filename, rows) {
+  const csv = rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function exportCsv(entries) {
   const head = ["reactor", "sensor", "type", "value", "threshold", "unit",
                 "timestamp", "acknowledged", "acknowledged_at"];
-  const lines = [head].concat(entries.map((e) => [
+  const rows = [head].concat(entries.map((e) => [
     e.reactor,
     e.sensor,
     (e.kind || "anomaly").toUpperCase(),
@@ -318,22 +293,25 @@ function exportCsv(entries) {
     e.acked ? "yes" : "no",
     e.ackedAt ? new Date(e.ackedAt * 1000).toISOString() : "",
   ]));
-  const csv = lines.map((r) => r.map(csvCell).join(",")).join("\r\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `anomalies-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  downloadCsv(`${safe(currentReactor)}-anomalies-${stamp()}.csv`, rows);
+}
+
+// Full trend history for one sensor of the currently-shown reactor.
+function exportSensorCsv(name) {
+  const h = history[keyFor(name)];
+  if (!h || !h.t.length) return;
+  const unit = UNITS[name] ? ` (${UNITS[name]})` : "";
+  const rows = [["timestamp", "value" + unit, "smoothed" + unit]];
+  for (let i = 0; i < h.t.length; i++) {
+    rows.push([new Date(h.t[i] * 1000).toISOString(), h.v[i], h.s[i] ?? ""]);
+  }
+  downloadCsv(`${safe(currentReactor)}-${safe(name)}-${stamp()}.csv`, rows);
 }
 
 function renderBulkBar() {
   const bar = document.getElementById("bulk-bar");
   bar.hidden = selected.size === 0;
   document.getElementById("bulk-count").textContent = `${selected.size} selected`;
-  if (bar.hidden) closeExportMenu();
 }
 
 function anomaliesInScope() {
@@ -891,8 +869,9 @@ function handleInit(msg) {
       s: [...(d.smoothed_series || [])],
     };
     const [reactor, name] = splitKey(key);
-    ingest(key, reactor, name, d);   // seed lastData/wasAnomalous; catch an active anomaly
+    ingest(key, reactor, name, d);   // seed lastData + chart history
   }
+  fetchAnomalies();                  // pull the shared log for the fresh tiles
   renderCurrentReactor();
   updateWatchlistStates();
   renderBreachIndicators();
@@ -916,6 +895,7 @@ function handleTick(msg) {
   updateWatchlistStates();
   renderBreachIndicators();
   renderStatusBand();
+  if (anomalyLogStale) { anomalyLogStale = false; fetchAnomalies(); }
 }
 
 function connect() {
@@ -945,9 +925,10 @@ async function pollHealth() {
 }
 setInterval(pollHealth, 3000);
 setInterval(renderStatusBand, 1000);   // keeps "updated Ns ago" ticking
+setInterval(fetchAnomalies, ANOMALY_POLL_MS);   // shared log, server-owned
 
 // Restore persisted state before wiring the DOM.
-loadAnomalies();
+fetchAnomalies();
 loadUiPrefs();
 
 // ------------------------------------------------------------------ events
@@ -1053,12 +1034,14 @@ document.getElementById("inject").addEventListener("click", async () => {
   });
 });
 
-// Tiles: acknowledge buttons + "Show graph".
+// Tiles: acknowledge buttons + "Show graph" + "Export CSV".
 document.getElementById("tiles").addEventListener("click", (e) => {
   const ack = e.target.closest(".ack-btn");
   if (ack) { acknowledge(ack.dataset.id); return; }
   const sg = e.target.closest(".show-graph");
-  if (sg) openOverlay(sg.closest(".tile").dataset.sensor);
+  if (sg) { openOverlay(sg.closest(".tile").dataset.sensor); return; }
+  const csv = e.target.closest(".tile-csv");
+  if (csv) exportSensorCsv(csv.closest(".tile").dataset.sensor);
 });
 
 document.getElementById("tiles").addEventListener("change", (e) => {
@@ -1094,46 +1077,15 @@ document.getElementById("anomalies").addEventListener("change", (e) => {
   }
 });
 
-function closeExportMenu() {
-  const list = document.getElementById("export-list");
-  const btn = document.getElementById("export-btn");
-  if (!list || !btn) return;
-  list.hidden = true;
-  btn.setAttribute("aria-expanded", "false");
-}
-
-const exportBtn = document.getElementById("export-btn");
-const exportList = document.getElementById("export-list");
-
-exportBtn.addEventListener("click", () => {
-  const opening = exportList.hidden;
-  exportList.hidden = !opening;
-  exportBtn.setAttribute("aria-expanded", String(opening));
-});
-
-exportList.addEventListener("click", (e) => {
-  const btn = e.target.closest("button[data-fmt]");
-  if (!btn || btn.disabled) return;
-  if (btn.dataset.fmt === "csv") {
-    const chosen = anomalyLog.filter((x) => selected.has(x.id));
-    if (chosen.length) exportCsv(chosen);
-  }
-  closeExportMenu();
-});
-
-document.addEventListener("click", (e) => {
-  if (!e.target.closest("#export-menu")) closeExportMenu();
+document.getElementById("bulk-csv").addEventListener("click", () => {
+  const chosen = anomalyLog.filter((x) => selected.has(x.id));
+  if (chosen.length) exportCsv(chosen);
 });
 
 document.getElementById("bulk-ack").addEventListener("click", () => {
-  const touched = [];
-  for (const id of [...selected]) {
-    const entry = markAcked(id);
-    if (entry) touched.push(entry);
-  }
+  const ids = [...selected];
   selected.clear();
-  commitAnomalies();
-  touched.forEach(reflectAck);
+  if (ids.length) ackAnomalies("/api/anomalies/ack", { ids });
 });
 
 document.getElementById("bulk-clear").addEventListener("click", () => {
@@ -1144,14 +1096,8 @@ document.getElementById("bulk-clear").addEventListener("click", () => {
 // "Acknowledge all" in the table header — every unacknowledged row currently in
 // scope (this reactor, or all reactors when that filter is on), across all pages.
 document.getElementById("ack-all").addEventListener("click", () => {
-  const touched = [];
-  for (const e of anomaliesInScope()) {
-    const entry = markAcked(e.id);
-    if (entry) touched.push(entry);
-  }
-  if (!touched.length) return;
-  commitAnomalies();
-  touched.forEach(reflectAck);
+  const showAll = document.getElementById("anom-all").checked;
+  ackAnomalies("/api/anomalies/ack-all", { reactor: showAll ? null : currentReactor });
 });
 
 // Collapsible sections (Dashboard, Anomalies).
