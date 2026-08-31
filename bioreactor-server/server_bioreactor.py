@@ -1,21 +1,44 @@
-import os
-import time
+"""Bioreactor OPC-UA simulator.
+
+Originally copied from Ganymede's OPC-UA demo repo; see README.md for the list
+of local changes. Each sensor is a small stochastic process whose value is
+written to an OPC-UA variable node named ``"<Category> - <Sensor>"`` under one
+object per reactor.
+
+Environment variables:
+  SERVER_URL   endpoint to bind (default opc.tcp://0.0.0.0:4840/ganymede/server/)
+  SEED         int seed for the RNG; makes the generated signals reproducible
+               across restarts (default: non-deterministic)
+  FAULT_RATE   0..1 — fraction of readings emitted with a Bad OPC-UA
+               StatusCode, so a client's bad-quality handling gets exercised
+               (default 0 = every reading is Good)
+  LOG_LEVEL    logging level when run directly (default INFO)
+"""
+
 import asyncio
 import logging
-
-from asyncua import Server, Node
-from asyncua.common.methods import uamethod
-
-import numpy as np
-from dataclasses import dataclass
+import math
+import os
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 
+import numpy as np
+from asyncua import Node, Server, ua
+
 _logger = logging.getLogger(__name__)
+
 SERVER_NAME = "Ganymede OPC-UA Server"
 SERVER_URI = "http://examples.ganymede.github.io"
 # 0.0.0.0 binds every interface; override only if you need the advertised
 # endpoint URL to carry a specific hostname.
 SERVER_URL = os.getenv("SERVER_URL", "opc.tcp://0.0.0.0:4840/ganymede/server/")
+
+_seed = os.getenv("SEED")
+RNG = np.random.default_rng(int(_seed) if _seed not in (None, "") else None)
+
+FAULT_RATE = max(0.0, min(1.0, float(os.getenv("FAULT_RATE", "0") or 0.0)))
 
 
 class NoiseType(Enum):
@@ -35,506 +58,321 @@ class Sensor:
     reporting_interval: float = 10.0
     sensor_node: Node | None = None
 
+    def _clamp(self, v: float) -> float:
+        return float(min(max(v, self.value_min), self.value_max))
+
 
 @dataclass
 class BrownianMotionSensor(Sensor):
-    """Brownian motion model for sensor value
+    """Ornstein-Uhlenbeck process: the value is pulled back toward a setpoint
+    (``value_init``, optionally ramping at ``value_drift`` units/second) with
+    Gaussian process noise whose *stationary* standard deviation is
+    ``value_std``, expressed in the sensor's own engineering units.
 
-    Parameters
-    ----------
-    Sensor : Sensor
-        Sensor object
+    This models a closed-loop-controlled process variable — it hugs its
+    setpoint and returns to it after a disturbance. (The original model was a
+    multiplicative random walk that wandered off until it hit a clamp and stuck
+    there, and whose step size scaled with the absolute value.)
 
-    Notes
-    -----
-    # dN/dt = mu + sigma * chi(t)
+    ``reversion_seconds`` is the OU relaxation time: roughly how long it takes to
+    pull a disturbance ~63% of the way back to setpoint.
     """
 
-    value_std: float = 1e-2
+    value_std: float = 0.01
     value_drift: float = 0.0
+    reversion_seconds: float = 90.0
+
+    def step(self, dt: float, age: float) -> float:
+        setpoint = self.value_init + self.value_drift * age
+        theta = 1.0 / max(self.reversion_seconds, 1e-6)
+        decay = math.exp(-theta * dt)                       # exact OU discretisation
+        noise_sd = self.value_std * math.sqrt(max(1.0 - decay * decay, 0.0))
+        nxt = setpoint + (self.value - setpoint) * decay + noise_sd * RNG.standard_normal()
+        self.value = self._clamp(nxt)
+        return self.value
 
 
 @dataclass
 class LogisticSensor(Sensor):
-    """Stochastic logistic growth model for sensor value
-
-    Parameters
-    ----------
-    Sensor : Sensor
-        Sensor object
-
-    Notes
-    -----
-    # if additive, dN/dt = rN(1 - N/K) + sigma * chi(t)
-    # if multiplicative, dN/dt = rN(1 - N/K) + sigma * N * chi(t)
-    #
-    # Where
-    # N is the value of the sensor,
-    # r is the growth rate,
-    # K is the carrying capacity,
-    # sigma is the standard deviation of the noise, and
-    # chi(t) is a white noise process
+    """Stochastic logistic growth: ``dX = r·X·(1 - X/K)·dt + noise``, with the
+    noise scaled by ``sqrt(dt)`` so it behaves as a Wiener process no matter the
+    reporting interval. ``value_max`` is the carrying capacity K, ``value_std``
+    the noise intensity, ``value_growth_rate`` is r in per-hour units.
     """
 
     noise_type: NoiseType = NoiseType.MULTIPLICATIVE
     value_growth_rate: float = 1e-3  # growth rate per hour
     value_std: float = 0.1
 
+    def step(self, dt: float, age: float) -> float:
+        x = self.value
+        r = self.value_growth_rate / 3600.0                 # per hour -> per second
+        growth = r * x * (1.0 - x / self.value_max) * dt
+        scale = x if self.noise_type == NoiseType.MULTIPLICATIVE else 1.0
+        noise = scale * self.value_std * math.sqrt(dt) * RNG.standard_normal()
+        self.value = self._clamp(x + growth + noise)
+        return self.value
 
+
+@dataclass
 class Instrument:
-    def __init__(
-        self,
-        obj: str,
-        name: str,
-        vars: list[BrownianMotionSensor | LogisticSensor],
-        instrument_type: str,
-    ):
-        """
-        Bioreactor object
-
-        Parameters
-        ----------
-        obj
-            OPC-UA object
-        name: str
-            Name of instrument
-        vars : dict[str, Sensor]
-            Sensors on instrument, key is sensor name, value is Sensor object
-        instrument_type : str
-            Type of instrument
-        """
-        self.obj = obj
-        self.name = name
-        self.vars = vars
+    node: Node
+    name: str
+    vars: list
 
 
 async def create_bioreactor(
-    server,
+    server: Server,
     idx: int,
     bioreactor_name: str,
     sensors: list[BrownianMotionSensor | LogisticSensor],
 ) -> Instrument:
-
     obj = await server.nodes.objects.add_object(idx, bioreactor_name)
 
-    sensor_list = []
-    for sensor in sensors:
-        sensor_var = await obj.add_variable(
-            idx, f"{sensor.sensor_type} - {sensor.sensor_name}", sensor.value_init
+    live: list[BrownianMotionSensor | LogisticSensor] = []
+    for spec in sensors:
+        node = await obj.add_variable(
+            idx, f"{spec.sensor_type} - {spec.sensor_name}", float(spec.value_init)
         )
-        await sensor_var.set_writable()
+        await node.set_writable()
+        # replace() copies EVERY field of the spec (the old hand-written rebuild
+        # silently dropped value_std, and value_max / value_min for logistic
+        # sensors, so every sensor ran at the dataclass defaults).
+        sensor = replace(spec, sensor_node=node)
+        sensor.value = float(spec.value_init)               # live state
+        live.append(sensor)
 
-        s: BrownianMotionSensor | LogisticSensor
+    return Instrument(node=obj, name=bioreactor_name, vars=live)
 
-        if isinstance(sensor, BrownianMotionSensor):
-            s = BrownianMotionSensor(
-                sensor_name=sensor.sensor_name,
-                sensor_type=sensor.sensor_type,
-                value_init=sensor.value_init,
-                value_drift=sensor.value_drift,
-                value_min=sensor.value_min,
-                value_max=sensor.value_max,
-                value_min_limit=sensor.value_min_limit,
-                value_max_limit=sensor.value_max_limit,
-                reporting_interval=sensor.reporting_interval,
-                sensor_node=sensor_var,
+
+async def _publish(node: Node, value: float) -> None:
+    """Write one reading. Most are Good; a FAULT_RATE fraction carry an
+    ``Uncertain`` StatusCode (a questionable-but-present value, like a fouled or
+    drifting probe) so a client's bad-quality path gets exercised. We keep the
+    value on the DataValue — a full ``Bad`` status nulls it, which naive clients
+    don't expect."""
+    if FAULT_RATE and RNG.random() < FAULT_RATE:
+        await node.write_value(
+            ua.DataValue(
+                Value=ua.Variant(float(value), ua.VariantType.Double),
+                StatusCode=ua.StatusCode(ua.StatusCodes.UncertainSensorNotAccurate),
+                SourceTimestamp=datetime.now(timezone.utc),
             )
-        elif isinstance(sensor, LogisticSensor):
-            s = LogisticSensor(
-                sensor_name=sensor.sensor_name,
-                sensor_type=sensor.sensor_type,
-                value_init=sensor.value_init,
-                value_growth_rate=sensor.value_growth_rate,
-                value_min_limit=sensor.value_min_limit,
-                value_max_limit=sensor.value_max_limit,
-                reporting_interval=sensor.reporting_interval,
-                sensor_node=sensor_var,
-                noise_type=sensor.noise_type,
-            )
-        else:
-            raise ValueError("Sensor type not supported")
-        sensor_list.append(s)
-
-    return Instrument(
-        obj=obj, name=bioreactor_name, vars=sensor_list, instrument_type="bioreactor"
-    )
+        )
+    else:
+        await node.write_value(float(value))
 
 
-async def main():
-    # setup our server
+async def main() -> None:
     server = Server()
     await server.init()
     server.set_endpoint(SERVER_URL)
     server.set_server_name(SERVER_NAME)
 
-    # set up our own namespace, not really necessary but should as spec
+    # our own namespace, per spec
     idx = await server.register_namespace(SERVER_URI)
 
-    obj_cytiva_wave = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Cytiva Wave",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=35.0,
-                value_max=40.0,
-                reporting_interval=5.5,
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=7.0,
-                value_std=0.1,
-                value_min=6.8,
-                value_max=7.2,
-                reporting_interval=7.1,
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=98.0,
-                value_std=0.1,
-                value_min=97.0,
-                value_max=100.0,
-                reporting_interval=3.3,
-            ),
-            BrownianMotionSensor(
-                sensor_name="Agitation Speed",
-                sensor_type="Process",
-                value_init=400.0,
-                value_std=1,
-                value_min=0.0,
-                value_max=1000.0,
-                reporting_interval=4.5,
-            ),
-            BrownianMotionSensor(
-                sensor_name="Air Flow Rate",
-                sensor_type="Process",
-                value_init=0.5,
-                value_std=0.005,
-                value_min=0.0,
-                value_max=1.0,
-                reporting_interval=6.0,
-            ),
-            LogisticSensor(
-                sensor_name="OD600",
-                sensor_type="Cell Growth",
-                value_init=0.05,
-                value_growth_rate=0.3,
-                value_max=2,
-                value_std=1e-6,
-                reporting_interval=1.1,
-                noise_type=NoiseType.ADDITIVE,
-            ),
-            BrownianMotionSensor(
-                sensor_name="Glucose Concentration",
-                sensor_type="Cell Growth",
-                value_init=20.0,
-                value_std=0.5,
-                value_min=0.0,
-                value_max=100.0,
-                reporting_interval=8.7,
-            ),
-            BrownianMotionSensor(
-                sensor_name="Lactate Concentration",
-                sensor_type="Cell Growth",
-                value_init=0.1,
-                value_std=0.2,
-                value_min=0.0,
-                value_max=10.0,
-                reporting_interval=10.3,
-            ),
-        ],
-    )
-
-    obj_cytiva_xdr = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Cytiva XDR",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=35.0,
-                value_max=39.0,
-                reporting_interval=2.0,
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=6.2,
-                value_std=0.1,
-                value_min=6.0,
-                value_max=6.4,
-                reporting_interval=5.1,
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=99.1,
-                value_std=0.1,
-                value_min=98.0,
-                value_max=100.0,
-                reporting_interval=15.2,
-            ),
-        ],
-    )
-
-    obj_sartorius_ambr = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Sartorius AMBR",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=0.0,
-                value_max=41.0,
-                reporting_interval=2.5,
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=5.7,
-                value_std=0.1,
-                value_min=5.5,
-                value_max=5.9,
-                reporting_interval=8.8,
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=100.0,
-                value_std=0.1,
-                value_min=99.0,
-                value_max=100.0,
-                reporting_interval=10.9,
-            ),
-        ],
-    )
-
-    obj_sartorius_biostat = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Sartorius Biostat",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=0.0,
-                value_max=41.0,
-                reporting_interval=2.5,
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=5.7,
-                value_std=0.1,
-                value_min=5.5,
-                value_max=5.9,
-                reporting_interval=8.8,
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=100.0,
-                value_std=0.1,
-                value_min=99.0,
-                value_max=100.0,
-                reporting_interval=10.9,
-            ),
-        ],
-    )
-
-    obj_eppendorf_bioflo = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Eppendorf BioFlo",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=0.0,
-                value_max=41.0,
-                reporting_interval=2.5,
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=5.7,
-                value_std=0.1,
-                value_min=5.5,
-                value_max=5.9,
-                reporting_interval=8.8,
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=100.0,
-                value_std=0.1,
-                value_min=99.0,
-                value_max=100.0,
-                reporting_interval=10.9,
-            ),
-        ],
-    )
-
-    obj_thermo_fisher_hyperforma = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Thermo Fisher HyPerforma",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=0.0,
-                value_max=41.0,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=5.7,
-                value_std=0.1,
-                value_min=5.5,
-                value_max=5.9,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=100.0,
-                value_std=0.1,
-                value_min=99.0,
-                value_max=100.0,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-        ],
-    )
-
-    obj_millipore_sigma_mobius = await create_bioreactor(
-        server=server,
-        idx=idx,
-        bioreactor_name="Millipore Sigma Mobius",
-        sensors=[
-            BrownianMotionSensor(
-                sensor_name="Temperature",
-                value_init=36.5,
-                value_std=0.1,
-                value_min=0.0,
-                value_max=41.0,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-            BrownianMotionSensor(
-                sensor_name="pH",
-                value_init=5.7,
-                value_std=0.1,
-                value_min=5.5,
-                value_max=5.9,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-            BrownianMotionSensor(
-                sensor_name="DO",
-                value_init=100.0,
-                value_std=0.1,
-                value_min=99.0,
-                value_max=100.0,
-                reporting_interval=np.random.uniform(1.0, 20.0),
-            ),
-        ],
-    )
-
     bioreactors = [
-        obj_cytiva_wave,
-        obj_cytiva_xdr,
-        obj_sartorius_ambr,
-        obj_sartorius_biostat,
-        obj_eppendorf_bioflo,
-        obj_thermo_fisher_hyperforma,
-        obj_millipore_sigma_mobius,
+        await create_bioreactor(
+            server, idx, "Cytiva Wave",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=35.0, value_max=40.0, reporting_interval=5.5,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=7.0, value_std=0.1,
+                    value_min=6.8, value_max=7.2, reporting_interval=7.1,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=98.0, value_std=0.1,
+                    value_min=97.0, value_max=100.0, reporting_interval=3.3,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="Agitation Speed", sensor_type="Process",
+                    value_init=400.0, value_std=1.0,
+                    value_min=0.0, value_max=1000.0, reporting_interval=4.5,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="Air Flow Rate", sensor_type="Process",
+                    value_init=0.5, value_std=0.005,
+                    value_min=0.0, value_max=1.0, reporting_interval=6.0,
+                ),
+                LogisticSensor(
+                    sensor_name="OD600", sensor_type="Cell Growth",
+                    value_init=0.05, value_growth_rate=0.3, value_max=2.0,
+                    value_std=1e-6, reporting_interval=1.1,
+                    noise_type=NoiseType.ADDITIVE,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="Glucose Concentration", sensor_type="Cell Growth",
+                    value_init=20.0, value_std=0.5,
+                    value_min=0.0, value_max=100.0, reporting_interval=8.7,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="Lactate Concentration", sensor_type="Cell Growth",
+                    value_init=0.1, value_std=0.2,
+                    value_min=0.0, value_max=10.0, reporting_interval=10.3,
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Cytiva XDR",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=35.0, value_max=39.0, reporting_interval=2.0,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=6.2, value_std=0.1,
+                    value_min=6.0, value_max=6.4, reporting_interval=5.1,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=99.1, value_std=0.1,
+                    value_min=98.0, value_max=100.0, reporting_interval=15.2,
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Sartorius AMBR",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=0.0, value_max=41.0, reporting_interval=2.5,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=5.7, value_std=0.1,
+                    value_min=5.5, value_max=5.9, reporting_interval=8.8,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=100.0, value_std=0.1,
+                    value_min=99.0, value_max=100.0, reporting_interval=10.9,
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Sartorius Biostat",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=0.0, value_max=41.0, reporting_interval=2.5,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=5.7, value_std=0.1,
+                    value_min=5.5, value_max=5.9, reporting_interval=8.8,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=100.0, value_std=0.1,
+                    value_min=99.0, value_max=100.0, reporting_interval=10.9,
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Eppendorf BioFlo",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=0.0, value_max=41.0, reporting_interval=2.5,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=5.7, value_std=0.1,
+                    value_min=5.5, value_max=5.9, reporting_interval=8.8,
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=100.0, value_std=0.1,
+                    value_min=99.0, value_max=100.0, reporting_interval=10.9,
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Thermo Fisher HyPerforma",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=0.0, value_max=41.0,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=5.7, value_std=0.1,
+                    value_min=5.5, value_max=5.9,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=100.0, value_std=0.1,
+                    value_min=99.0, value_max=100.0,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+            ],
+        ),
+        await create_bioreactor(
+            server, idx, "Millipore Sigma Mobius",
+            [
+                BrownianMotionSensor(
+                    sensor_name="Temperature",
+                    value_init=36.5, value_std=0.1,
+                    value_min=0.0, value_max=41.0,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+                BrownianMotionSensor(
+                    sensor_name="pH",
+                    value_init=5.7, value_std=0.1,
+                    value_min=5.5, value_max=5.9,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+                BrownianMotionSensor(
+                    sensor_name="DO",
+                    value_init=100.0, value_std=0.1,
+                    value_min=99.0, value_max=100.0,
+                    reporting_interval=RNG.uniform(1.0, 20.0),
+                ),
+            ],
+        ),
     ]
-    last_report_times = {
-        f"{bioreactor.name}: {sensor.sensor_name}": time.perf_counter()
-        for bioreactor in bioreactors
-        for sensor in bioreactor.vars
-    }
 
-    _logger.info("Starting server!")
+    n_sensors = sum(len(b.vars) for b in bioreactors)
+    _logger.info(
+        "serving %d reactors / %d sensors  (seed=%s, fault_rate=%s)",
+        len(bioreactors), n_sensors, _seed or "random", FAULT_RATE,
+    )
+
+    start = time.perf_counter()
+    last_report = {id(s): start for b in bioreactors for s in b.vars}
+
     async with server:
         while True:
-            current_time = time.perf_counter()
-
+            now = time.perf_counter()
             for bioreactor in bioreactors:
                 for sensor in bioreactor.vars:
-                    last_report_time = last_report_times[
-                        f"{bioreactor.name}: {sensor.sensor_name}"
-                    ]
-                    elapsed_time = current_time - last_report_time
-
-                    if elapsed_time >= sensor.reporting_interval:
-                        sensor_node_value = await sensor.sensor_node.get_value()
-
-                        if isinstance(sensor, LogisticSensor):
-                            noise_multiplier = (
-                                sensor_node_value
-                                if sensor.noise_type == NoiseType.MULTIPLICATIVE
-                                else 1
-                            )
-
-                            deterministic_growth = (
-                                (sensor.value_growth_rate / 60 / 60)
-                                * sensor_node_value
-                                * (1 - sensor_node_value / sensor.value_max)
-                                * (sensor.reporting_interval / 60)
-                            )
-                            noise = (
-                                noise_multiplier
-                                * sensor.value_std
-                                * np.random.normal(
-                                    0, np.sqrt(sensor.reporting_interval / 60)
-                                )
-                            )
-
-                            new_val = float(
-                                np.minimum(
-                                    np.maximum(
-                                        sensor_node_value
-                                        + deterministic_growth
-                                        + noise,
-                                        sensor.value_min,
-                                    ),
-                                    sensor.value_max,
-                                )
-                            )
-                        else:
-                            new_val = float(
-                                np.maximum(
-                                    np.minimum(
-                                        sensor_node_value
-                                        * np.random.normal(
-                                            1.0,
-                                            sensor.value_std,
-                                        )
-                                        + sensor.value_drift,
-                                        sensor.value_max,
-                                    ),
-                                    sensor.value_min,
-                                )
-                            )
-
-                        await sensor.sensor_node.write_value(new_val)
-
-                        _logger.info(
-                            "Bioreactor %s, Sensor %s updated from %.4f to %.4f",
-                            bioreactor.name,
-                            f"{sensor.sensor_type}: {sensor.sensor_name}",
-                            sensor_node_value,
-                            new_val,
-                        )
-
-                        last_report_times[
-                            f"{bioreactor.name}: {sensor.sensor_name}"
-                        ] = current_time
-
-            await asyncio.sleep(0.01)
+                    dt = now - last_report[id(sensor)]
+                    if dt < sensor.reporting_interval:
+                        continue
+                    value = sensor.step(dt, age=now - start)
+                    await _publish(sensor.sensor_node, value)
+                    last_report[id(sensor)] = now
+                    _logger.debug(
+                        "%s / %s -> %.4f", bioreactor.name, sensor.sensor_name, value
+                    )
+            await asyncio.sleep(0.05)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    asyncio.run(main(), debug=True)
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    asyncio.run(main())
