@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import config
+from app.anomalies import AnomalyStore
 from app.hub import ConnectionManager, broadcast_loop
 from app.models import Reading
 from app.processing import robust_sigma
@@ -30,9 +31,11 @@ async def lifespan(app: FastAPI):
     for reactor, thresholds in app.state.watchlists.all_active().items():
         app.state.store.apply_watchlist(reactor, thresholds)
 
+    app.state.anomalies = AnomalyStore()
+
     tasks = [
         asyncio.create_task(run_source_forever(app.state.queue, app.state.status)),
-        asyncio.create_task(drain(app.state.queue, app.state.store)),
+        asyncio.create_task(drain(app.state.queue, app.state.store, app.state.anomalies)),
         asyncio.create_task(
             broadcast_loop(
                 app.state.hub, app.state.store, app.state.status, config.BROADCAST_HZ
@@ -181,6 +184,36 @@ async def watchlist_saved_delete(name: str, reactor: str):
     if not app.state.watchlists.delete(reactor, name):
         raise HTTPException(404, f"no saved watchlist {name!r} for {reactor!r}")
     return {"deleted": name, "names": app.state.watchlists.names(reactor)}
+
+
+@app.get("/api/anomalies")
+async def anomalies_get(reactor: str | None = None):
+    """The anomaly / alarm log, oldest-first. ``?reactor=`` scopes to one reactor;
+    the browser fetches the lot and filters client-side."""
+    return {"anomalies": app.state.anomalies.all(reactor)}
+
+
+class AckBody(BaseModel):
+    ids: list[str] = []
+
+
+@app.post("/api/anomalies/ack")
+async def anomalies_ack(body: AckBody):
+    """Acknowledge specific rows by id. Returns the full log so the browser can
+    just replace its copy."""
+    app.state.anomalies.ack(body.ids)
+    return {"anomalies": app.state.anomalies.all()}
+
+
+class AckAllBody(BaseModel):
+    reactor: str | None = None
+
+
+@app.post("/api/anomalies/ack-all")
+async def anomalies_ack_all(body: AckAllBody):
+    """Acknowledge every open row (optionally just one reactor's)."""
+    app.state.anomalies.ack_all(body.reactor)
+    return {"anomalies": app.state.anomalies.all()}
 
 
 class Injection(BaseModel):

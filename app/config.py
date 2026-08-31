@@ -37,3 +37,6 @@ ANOMALY_WINDOW = 21
 # Consecutive flagged readings before a sensor is *reported* as anomalous. A
 # lone flip from noise never reaches this, so it can't spawn a log entry.
 ANOMALY_CONFIRM = int(os.getenv("ANOMALY_CONFIRM") or 3)
+# Rows kept in the anomaly log *per reactor* before the oldest is dropped. A
+# busy reactor can't push another reactor's history out of the file.
+MAX_ANOMALIES = int(os.getenv("MAX_ANOMALIES") or 100)
