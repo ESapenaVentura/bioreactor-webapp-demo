@@ -147,11 +147,36 @@ class Store:
         }
 
 
-async def drain(queue, store):
+def _record_edges(anomalies, store, state, was_anomaly, was_status) -> None:
+    """Log a row when a sensor *enters* an alarm state (not on every reading it
+    stays there). The browser only mirrors this file, so detection has one home."""
+    value, when = state.values[-1], state.times[-1]
+    if state.anomaly and not was_anomaly:
+        anomalies.record(state.reactor, state.sensor, value, when, "anomaly", None)
+    if state.status != "ok" and state.status != was_status:
+        band = store.watchlists.get(state.reactor, {}).get(state.sensor)  # (low, high) | None
+        threshold = None
+        if band:
+            threshold = band[1] if state.status == "high" else band[0]
+        anomalies.record(state.reactor, state.sensor, value, when, state.status, threshold)
+
+
+async def drain(queue, store, anomalies=None):
     while True:
         reading = await queue.get()
         try:
+            prev = store.sensors.get(reading.key)
+            was_anomaly = prev.anomaly if prev else False
+            was_status = prev.status if prev else "ok"
+            count_before = prev.count if prev else 0
+
             store.add(reading)
+
+            state = store.sensors[reading.key]
+            # count only moves when the reading was actually accepted (an
+            # out-of-order timestamp is dropped) — skip the edge check otherwise.
+            if anomalies is not None and state.count > count_before:
+                _record_edges(anomalies, store, state, was_anomaly, was_status)
         except Exception:                          # one bad reading must not kill the consumer
             log.exception("dropping reading for %s", reading.key)
         finally:
