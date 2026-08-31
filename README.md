@@ -130,6 +130,48 @@ SERVER_URL=opc.tcp://localhost:4840/ganymede/server/ python -m app.main
 You'll need an OPC-UA server running separately — e.g.
 `python bioreactor-server/serve.py`.
 
+## API endpoints
+
+The dashboard is just one client of a small HTTP + WebSocket API. Responses are
+JSON unless noted. A `?reactor=` query parameter, where accepted, scopes the
+result to one reactor.
+
+### Live data
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | The single-page dashboard (HTML). |
+| `WS /ws` | Telemetry stream: one `init` frame with the full ~600-point history per sensor on connect, then `tick` frames carrying the latest reading per sensor at `BROADCAST_HZ`. |
+| `GET /api/snapshot?reactor=` | The same payload as the WebSocket `init` frame, as a plain GET (this is what the tests assert against). |
+| `GET /api/reactors` | Reactor names discovered on the OPC-UA server, plus which one is the default selection. |
+| `GET /api/health?reactor=` | Connection state (`connected`, `last_error`), sensor and reading counts, and the number of connected browsers. |
+
+### Anomaly log
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/anomalies?reactor=` | The anomaly / alarm log, oldest first. |
+| `POST /api/anomalies/ack` | Acknowledge specific rows — body `{"ids": ["…"]}`. Returns the full log. |
+| `POST /api/anomalies/ack-all` | Acknowledge every open row — body `{"reactor": "Cytiva Wave"}` for one reactor, or `{}` for all. |
+
+### Watchlist
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/watchlist?reactor=` | A reactor's active min/max limits plus the names of its saved presets. |
+| `GET /api/watchlists` | Active limits and preset names for every reactor in one call (used on page load). |
+| `POST /api/watchlist` | Set a reactor's active limits — body `{"reactor": "…", "thresholds": {"pH": {"min": 6.8, "max": 7.2}}}`. An empty `thresholds` unloads. |
+| `DELETE /api/watchlist?reactor=` | Unload a reactor's active watchlist. |
+| `GET /api/watchlist/saved/{name}?reactor=` | Fetch a saved preset's thresholds. |
+| `PUT /api/watchlist/saved/{name}` | Save a preset — body as for `POST /api/watchlist`. |
+| `DELETE /api/watchlist/saved/{name}?reactor=` | Delete a saved preset. |
+
+### Demo
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/debug/inject` | Push a synthetic reading onto the same queue as real data, to exercise the anomaly path — body `{"reactor": "…", "sensor": "Temperature", "sigmas": 10}`. |
+
 ## Configuration
 
 All settings are environment variables (see `app/config.py`):
